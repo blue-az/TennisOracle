@@ -11,7 +11,7 @@ import SwiftUI
 struct TennisOracleApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            TennisiPhoneContentView()
         }
     }
 }
