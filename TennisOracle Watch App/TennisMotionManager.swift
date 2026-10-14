@@ -3,6 +3,62 @@ import WatchConnectivity
 import HealthKit
 import WatchKit
 
+/// Crash-safe observability journal. This records transport/lifecycle state only;
+/// detector inputs and thresholds are unchanged.
+private final class TennisDiagnostics {
+    private let defaults = UserDefaults.standard
+    private let queue = DispatchQueue(label: "tennis.oracle.diagnostics")
+    private let fileURL: URL
+    private let encoder = JSONEncoder()
+
+    init() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        fileURL = base.appendingPathComponent("tennis-oracle-events.jsonl")
+        if defaults.bool(forKey: "tennis.oracle.recording") {
+            append("unclean_exit_detected", fields: ["previous_session_uuid": defaults.string(forKey: "tennis.oracle.session_uuid") ?? ""])
+            defaults.set(false, forKey: "tennis.oracle.recording")
+        }
+        append("launch", fields: [:])
+    }
+
+    func beginSession(_ id: String, mode: String) {
+        defaults.set(true, forKey: "tennis.oracle.recording")
+        defaults.set(id, forKey: "tennis.oracle.session_uuid")
+        append("recording_started", fields: ["session_uuid": id, "mode": mode])
+    }
+
+    func endSession(_ id: String, reason: String) {
+        defaults.set(false, forKey: "tennis.oracle.recording")
+        append("recording_ended", fields: ["session_uuid": id, "reason": reason])
+    }
+
+    func record(_ event: String, fields: [String: Any]) {
+        append(event, fields: fields)
+    }
+
+    private func append(_ event: String, fields: [String: Any]) {
+        queue.async { [fileURL, encoder] in
+            var object: [String: Any] = [
+                "event": event,
+                "wall_time": Date().timeIntervalSince1970,
+                "monotonic_ns": DispatchTime.now().uptimeNanoseconds
+            ]
+            fields.forEach { object[$0.key] = $0.value }
+            guard JSONSerialization.isValidJSONObject(object),
+                  let data = try? JSONSerialization.data(withJSONObject: object),
+                  let line = String(data: data, encoding: .utf8) else { return }
+            if let handle = try? FileHandle(forWritingTo: fileURL) {
+                handle.seekToEndOfFile()
+                handle.write((line + "\n").data(using: .utf8)!)
+                try? handle.close()
+            } else {
+                try? (line + "\n").data(using: .utf8)?.write(to: fileURL, options: .atomic)
+            }
+        }
+    }
+}
+
 class TennisMotionManager: NSObject, ObservableObject, WCSessionDelegate {
     private let motionManager = CMMotionManager()
     private let healthStore = HKHealthStore()
@@ -21,12 +77,22 @@ class TennisMotionManager: NSObject, ObservableObject, WCSessionDelegate {
     @Published var shotCount: Int = 0   // increments on every shot → triggers onChange
 
     private var sessionStartTime: Date?
+    private var sessionUUID: String?
+    private let diagnostics = TennisDiagnostics()
+    private let outboxDirectory: URL
     private var sampleBuffer: [TennisSensorSample] = []
-    private let batchSize = 50 
+    private let batchSize = 50
+    // Identifies each batch so the Mac can drop duplicates — WatchConnectivity has been
+    // observed delivering the same sendMessage batch twice (see raw_sensor_buffer rows
+    // with identical timestamps, 2026-09-02). Unique per session, not persisted.
+    private var nextBatchSeq: Int = 0
 
     let sampleRate: Double = 100.0 
 
     override init() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        outboxDirectory = base.appendingPathComponent("tennis-oracle-outbox", isDirectory: true)
+        try? FileManager.default.createDirectory(at: outboxDirectory, withIntermediateDirectories: true)
         super.init()
         if WCSession.isSupported() {
             WCSession.default.delegate = self
@@ -37,17 +103,34 @@ class TennisMotionManager: NSObject, ObservableObject, WCSessionDelegate {
     // MARK: - WCSessionDelegate
     func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
         print("🎾 Watch Connectivity Activated: \(activationState.rawValue)")
+        diagnostics.record("wc_activation", fields: [
+            "state": activationState.rawValue,
+            "reachable": session.isReachable,
+            "error": error?.localizedDescription ?? ""
+        ])
+        retryPendingBatches()
+    }
+
+    func sessionReachabilityDidChange(_ session: WCSession) {
+        diagnostics.record("wc_reachability", fields: ["reachable": session.isReachable])
+        retryPendingBatches()
     }
     
     func session(_ session: WCSession, didReceiveMessage message: [String : Any]) {
-        if message["type"] as? String == "tennis_shot_detected" {
-            applyShot(message)
-        }
+        handleIncoming(message)
     }
 
     func session(_ session: WCSession, didReceiveUserInfo userInfo: [String : Any] = [:]) {
-        if userInfo["type"] as? String == "tennis_shot_detected" {
-            applyShot(userInfo)
+        handleIncoming(userInfo)
+    }
+
+    private func handleIncoming(_ message: [String: Any]) {
+        if message["type"] as? String == "tennis_shot_detected" { applyShot(message) }
+        if message["type"] as? String == "batch_ack",
+           let seq = message["batch_seq"] as? Int,
+           let sid = message["session_uuid"] as? String {
+            removeOutbox(sessionID: sid, batchSeq: seq)
+            diagnostics.record("batch_ack_received", fields: ["session_uuid": sid, "batch_seq": seq, "status": message["status"] ?? ""])
         }
     }
 
@@ -69,7 +152,10 @@ class TennisMotionManager: NSObject, ObservableObject, WCSessionDelegate {
 
         isRecording = true
         sessionStartTime = Date()
+        sessionUUID = UUID().uuidString
         sampleBuffer.removeAll()
+        nextBatchSeq = 0
+        diagnostics.beginSession(sessionUUID!, mode: mode.rawValue)
 
         workoutManager.startWorkout()
 
@@ -154,24 +240,87 @@ class TennisMotionManager: NSObject, ObservableObject, WCSessionDelegate {
         }
 
         let samplesData = sampleBuffer.map { $0.toDictionary() }
+        let batchSeq = nextBatchSeq
+        nextBatchSeq += 1
+        let sessionID = sessionUUID ?? "unknown"
+        diagnostics.record("batch_send_started", fields: [
+            "session_uuid": sessionID, "batch_seq": batchSeq,
+            "sample_count": samplesData.count,
+            "first_sample": sampleBuffer.first?.timestamp as Any,
+            "last_sample": sampleBuffer.last?.timestamp as Any,
+            "reachable": WCSession.default.isReachable
+        ])
         let message: [String: Any] = [
             "type": "tennis_sensor_batch",
+            "session_uuid": sessionID,
             "samples": samplesData,
             "timestamp": Date().timeIntervalSince1970,
-            "mode": self.mode.rawValue
+            "mode": self.mode.rawValue,
+            "batch_seq": batchSeq
         ]
 
+        persistOutbox(message, sessionID: sessionID, batchSeq: batchSeq)
         if WCSession.default.isReachable {
-            WCSession.default.sendMessage(message, replyHandler: nil)
+            WCSession.default.sendMessage(message, replyHandler: { [weak self] _ in
+                self?.diagnostics.record("batch_send_completed", fields: ["session_uuid": sessionID, "batch_seq": batchSeq, "path": "sendMessage"])
+            }, errorHandler: { [weak self] error in
+                self?.diagnostics.record("batch_send_error", fields: ["session_uuid": sessionID, "batch_seq": batchSeq, "path": "sendMessage", "error": error.localizedDescription])
+            })
         } else {
             WCSession.default.transferUserInfo(message)
+            diagnostics.record("batch_send_completed", fields: ["session_uuid": sessionID, "batch_seq": batchSeq, "path": "transferUserInfo"])
         }
         sampleBuffer.removeAll()
     }
 
+    private func persistOutbox(_ message: [String: Any], sessionID: String, batchSeq: Int) {
+        guard let data = try? JSONSerialization.data(withJSONObject: message) else { return }
+        let url = outboxDirectory.appendingPathComponent("\(sessionID)_\(batchSeq).json")
+        do {
+            try data.write(to: url, options: .atomic)
+            diagnostics.record("outbox_persisted", fields: ["session_uuid": sessionID, "batch_seq": batchSeq])
+        } catch {
+            diagnostics.record("outbox_persist_error", fields: ["session_uuid": sessionID, "batch_seq": batchSeq, "error": error.localizedDescription])
+        }
+    }
+
+    private func removeOutbox(sessionID: String, batchSeq: Int) {
+        let url = outboxDirectory.appendingPathComponent("\(sessionID)_\(batchSeq).json")
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func retryPendingBatches() {
+        guard WCSession.default.isReachable,
+              let files = try? FileManager.default.contentsOfDirectory(at: outboxDirectory, includingPropertiesForKeys: nil) else { return }
+        guard let activeID = sessionUUID else {
+            diagnostics.record("outbox_retry_deferred", fields: ["reason": "no_active_session", "pending_files": files.count])
+            return
+        }
+        for url in files where url.pathExtension == "json" && url.lastPathComponent.hasPrefix(activeID + "_") {
+            guard let data = try? Data(contentsOf: url),
+                  let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            WCSession.default.sendMessage(message, replyHandler: nil) { [weak self] error in
+                self?.diagnostics.record("batch_retry_error", fields: ["error": error.localizedDescription])
+            }
+            diagnostics.record("batch_retry", fields: ["file": url.lastPathComponent, "session_uuid": activeID])
+        }
+    }
+
     func stopSession() {
+        let id = sessionUUID ?? "unknown"
+        diagnostics.record("recording_stopped", fields: ["session_uuid": id, "buffered_samples": sampleBuffer.count])
         isRecording = false
         motionManager.stopDeviceMotionUpdates()
         workoutManager.stopWorkout()
+        diagnostics.endSession(id, reason: "user_stop")
+        sessionUUID = nil
+    }
+
+    func recordScene(_ phase: String) {
+        diagnostics.record("scene_\(phase)", fields: [
+            "session_uuid": sessionUUID ?? "",
+            "recording": isRecording,
+            "buffered_samples": sampleBuffer.count
+        ])
     }
 }
